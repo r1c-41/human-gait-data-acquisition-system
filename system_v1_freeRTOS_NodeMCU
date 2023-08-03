@@ -1,0 +1,286 @@
+#include <Arduino.h>
+#include "MPU6050.h"
+#include <WiFi.h>
+#include <OneWire.h>
+
+#define P4 39 // давление правая носок 
+#define P3 33 // давление правая пятка 
+#define P2 32 // давление левая носок
+#define P1 35 // давление левая пятка
+#define An2 34 // угол правый 
+#define An1 36 // угол левый 
+
+const int footRight = 16; // стопа правая 
+const int footLeft = 5; // стопа левая
+const int shinRight = 18; // голень правая 
+const int shinLeft = 23; // голень левая
+const int hipRight = 19; // ляшка правая 
+const int hipLeft = 17; // ляшка левая
+const int orderIMU[] = {footRight, footLeft, shinRight, shinLeft, hipRight, hipLeft};
+
+#define port 80
+MPU6050 mpu(0x69);
+MPU6050 mpuSleep(0x68);
+
+const char* ssid     = "SYSTEM";
+const char* password = "123456789";
+WiFiServer server(port);
+WiFiClient client;
+IPAddress IP;
+
+const int buffersize = 70;     // количество итераций калибровки
+const int acel_deadzone = 10;  // точность калибровки акселерометра (по умолчанию 8)
+const int gyro_deadzone = 6;   // точность калибровки гироскопа (по умолчанию 2)
+int mean_ax, mean_ay, mean_az, mean_gx, mean_gy, mean_gz;
+int ax_offset, ay_offset, az_offset, gx_offset, gy_offset, gz_offset;
+int16_t ax, ay, az, gx, gy, gz;
+
+int16_t ax1, ay1, az1, gx1, gy1, gz1;
+int16_t ax2, ay2, az2, gx2, gy2, gz2;
+int16_t ax3, ay3, az3, gx3, gy3, gz3;
+int16_t ax4, ay4, az4, gx4, gy4, gz4;
+int16_t ax5, ay5, az5, gx5, gy5, gz5;
+int16_t ax6, ay6, az6, gx6, gy6, gz6;
+
+int16_t* ax1_uk = &ax1; int16_t* ay1_uk = &ay1; int16_t* az1_uk = &az1; int16_t* gx1_uk = &gx1; int16_t* gy1_uk = &gy1; int16_t* gz1_uk = &gz1;
+int16_t* ax2_uk = &ax2; int16_t* ay2_uk = &ay2; int16_t* az2_uk = &az2; int16_t* gx2_uk = &gx2; int16_t* gy2_uk = &gy2; int16_t* gz2_uk = &gz2;
+int16_t* ax3_uk = &ax3; int16_t* ay3_uk = &ay3; int16_t* az3_uk = &az3; int16_t* gx3_uk = &gx3; int16_t* gy3_uk = &gy3; int16_t* gz3_uk = &gz3;
+int16_t* ax4_uk = &ax4; int16_t* ay4_uk = &ay4; int16_t* az4_uk = &az4; int16_t* gx4_uk = &gx4; int16_t* gy4_uk = &gy4; int16_t* gz4_uk = &gz4;
+int16_t* ax5_uk = &ax5; int16_t* ay5_uk = &ay5; int16_t* az5_uk = &az5; int16_t* gx5_uk = &gx5; int16_t* gy5_uk = &gy5; int16_t* gz5_uk = &gz5;
+int16_t* ax6_uk = &ax6; int16_t* ay6_uk = &ay6; int16_t* az6_uk = &az6; int16_t* gx6_uk = &gx6; int16_t* gy6_uk = &gy6; int16_t* gz6_uk = &gz6;
+
+int16_t arrayGPIO[] = {0, 0, 0, 0, 0, 0};
+String req;
+
+TaskHandle_t clientWiFi;
+TaskHandle_t calibration_IMU;
+TaskHandle_t readGPIO;
+TaskHandle_t sendingData;
+void clientControll(void * pvParameters);
+void calibration(void * pvParameters);
+void dataGPIO(void * pvParameters);
+void sendData(void * pvParameters);
+SemaphoreHandle_t startCal;
+QueueHandle_t arrayQueue;
+
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(22,21);
+
+  WiFi.softAP(ssid, password);
+  IP = WiFi.softAPIP();
+  Serial.print("AP IP address: ");
+  Serial.println(IP);
+  server.begin();
+  Serial.printf("IP port: %d\n",port);			
+  server.begin(port);
+
+  pinMode(P4, INPUT);
+  pinMode(P3, INPUT);
+  pinMode(P2, INPUT);
+  pinMode(P1, INPUT);
+  pinMode(An2, INPUT);
+  pinMode(An1, INPUT);
+
+  for(int i = 0; i < 6; i++){
+    uint8_t nomber = orderIMU[i];
+    pinMode(nomber, OUTPUT);
+    digitalWrite(nomber, LOW);
+  }
+
+  for(int i = 0; i < 6; i++){
+    uint8_t nomber = orderIMU[i];
+    digitalWrite(nomber, HIGH);
+    mpu.initialize();
+    Serial.println(mpu.testConnection() ? "MPU6050 connection successful" : "MPU6050 connection failed");
+    mpu.setXAccelOffset(0);
+    mpu.setYAccelOffset(0);
+    mpu.setZAccelOffset(0);
+    mpu.setXGyroOffset(0);
+    mpu.setYGyroOffset(0);
+    mpu.setZGyroOffset(0);
+    digitalWrite(nomber, LOW);
+    delay(100);
+  }
+  startCal = xSemaphoreCreateBinary();
+  arrayQueue=xQueueCreate(6, sizeof(int16_t));
+  xTaskCreatePinnedToCore(calibration, "calibration", 2048, NULL, 3, &calibration_IMU, 1);
+  xTaskCreatePinnedToCore(sendData, "send", 4096, NULL, 1, &sendingData, 1);
+  xTaskCreatePinnedToCore(dataGPIO, "dataGPIO", 4096, NULL, 1, &readGPIO, 0);
+  xTaskCreatePinnedToCore(clientControll, "clientWiFi", 2048, NULL, 2, &clientWiFi, 1); //configMAX_PRIORITIES
+  vTaskSuspend(readGPIO);
+  vTaskSuspend(sendingData);
+}
+
+void loop() {
+}
+
+void clientControll(void * pvParameters){
+  for(;;){
+    client = server.available();   
+    if (client.connected()){
+      if (client.available()){                  
+      req = client.readStringUntil('\n'); 
+      if(req == "1"){  // калибровка
+         xSemaphoreGive(startCal);
+         req = "0";      
+        } 
+        else if (req == "2"){
+          vTaskResume(readGPIO);
+          vTaskResume(sendingData);
+          vTaskPrioritySet(readGPIO, configMAX_PRIORITIES-1);
+          vTaskPrioritySet(sendingData, configMAX_PRIORITIES-1);
+          vTaskDelete(calibration_IMU);
+          vTaskSuspend(NULL);
+        }
+        else{
+        Serial.println("invalid request");
+        client.stop();
+        }
+      }
+    }
+  vTaskDelay(10);
+  }
+}
+
+void calibration(void * pvParameters) {
+  for(;;){
+    if (xSemaphoreTake(startCal, portMAX_DELAY) == pdTRUE) {
+      vTaskSuspend(clientWiFi);
+      for(int k = 0; k < 6; k++){
+        Serial.print(k+1);
+        uint8_t nomber = orderIMU[k];
+        digitalWrite(nomber, HIGH);
+        long buff_ax = 0, buff_ay = 0, buff_az = 0, buff_gx = 0, buff_gy = 0, buff_gz = 0;
+        for (int i = 0; i < (buffersize + 101); i++) { // read raw accel/gyro measurements from device
+          mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+          if (i > 100 && i <= (buffersize + 100)) { //First 100 measures are discarded
+            buff_ax = buff_ax + ax;
+            buff_ay = buff_ay + ay;
+            buff_az = buff_az + az;
+            buff_gx = buff_gx + gx;
+            buff_gy = buff_gy + gy;
+            buff_gz = buff_gz + gz;
+          }
+          if (i == (buffersize + 100)) {
+            mean_ax = buff_ax / buffersize;
+            mean_ay = buff_ay / buffersize;
+            mean_az = buff_az / buffersize;
+            mean_gx = buff_gx / buffersize;
+            mean_gy = buff_gy / buffersize;
+            mean_gz = buff_gz / buffersize;
+          }
+          delay(1);
+        }
+        ax_offset = -mean_ax / 8;
+        ay_offset = -mean_ay / 8;
+        az_offset = (16384 - mean_az) / 8;
+        gx_offset = -mean_gx / 4;
+        gy_offset = -mean_gy / 4;
+        gz_offset = -mean_gz / 4;
+        while (1) {
+          int ready = 0;
+          mpu.setXAccelOffset(ax_offset);
+          mpu.setYAccelOffset(ay_offset);
+          mpu.setZAccelOffset(az_offset);
+          mpu.setXGyroOffset(gx_offset);
+          mpu.setYGyroOffset(gy_offset);
+          mpu.setZGyroOffset(gz_offset);
+          long buff_ax = 0, buff_ay = 0, buff_az = 0, buff_gx = 0, buff_gy = 0, buff_gz = 0;
+          for (int i = 0; i < (buffersize + 101); i++) { // read raw accel/gyro measurements from device
+            mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+            if (i > 100 && i <= (buffersize + 100)) { //First 100 measures are discarded
+              buff_ax = buff_ax + ax;
+              buff_ay = buff_ay + ay;
+              buff_az = buff_az + az;
+              buff_gx = buff_gx + gx;
+              buff_gy = buff_gy + gy;
+              buff_gz = buff_gz + gz;
+            }
+            if (i == (buffersize + 100)) {
+              mean_ax = buff_ax / buffersize;
+              mean_ay = buff_ay / buffersize;
+              mean_az = buff_az / buffersize;
+              mean_gx = buff_gx / buffersize;
+              mean_gy = buff_gy / buffersize;
+              mean_gz = buff_gz / buffersize;
+            }
+            delay(1);
+          }
+          Serial.println("...");
+          if (abs(mean_ax) <= acel_deadzone) ready++;
+          else ax_offset = ax_offset - mean_ax / acel_deadzone;
+          if (abs(mean_ay) <= acel_deadzone) ready++;
+          else ay_offset = ay_offset - mean_ay / acel_deadzone;
+          if (abs(16384 - mean_az) <= acel_deadzone) ready++;
+          else az_offset = az_offset + (16384 - mean_az) / acel_deadzone;
+          if (abs(mean_gx) <= gyro_deadzone) ready++;
+          else gx_offset = gx_offset - mean_gx / (gyro_deadzone + 1);
+          if (abs(mean_gy) <= gyro_deadzone) ready++;
+          else gy_offset = gy_offset - mean_gy / (gyro_deadzone + 1);
+          if (abs(mean_gz) <= gyro_deadzone) ready++;
+          else gz_offset = gz_offset - mean_gz / (gyro_deadzone + 1);
+          if (ready == 6) break;
+        }
+        digitalWrite(nomber, LOW);
+        client.println("OK");
+        Serial.println("ok");
+      }
+      client.println("DONE :)");
+      vTaskResume(clientWiFi);
+    }
+  }
+}
+
+void dataGPIO(void *pvParameters){
+  for (;;){
+    arrayGPIO[0] = analogRead(P1);
+    arrayGPIO[1] = analogRead(P2);
+    arrayGPIO[2] = analogRead(P3); //P3
+    arrayGPIO[3] = analogRead(P4); //P4
+    arrayGPIO[4] = analogRead(An1);  //An1
+    arrayGPIO[5] = analogRead(An2); //An2
+    xQueueSend(arrayQueue,&arrayGPIO,portMAX_DELAY);
+  }
+}
+
+void sendData(void *pvParameters){
+  
+  for (;;){
+    //int time2 = millis();
+    digitalWrite(footLeft, HIGH);
+    mpu.getMotion6(&ax1, &ay1, &az1, &gx1, &gy1, &gz1);  
+    digitalWrite(footLeft, LOW);
+
+    digitalWrite(footRight, HIGH);
+    mpu.getMotion6(&ax2, &ay2, &az2, &gx2, &gy2, &gz2);
+    digitalWrite(footRight, LOW);
+
+    digitalWrite(shinLeft, HIGH);  
+    mpu.getMotion6(&ax3, &ay3, &az3, &gx3, &gy3, &gz3); 
+    digitalWrite(shinLeft, LOW); 
+
+    digitalWrite(shinRight, HIGH);
+    mpu.getMotion6(&ax4, &ay4, &az4, &gx4, &gy4, &gz4);  
+    digitalWrite(shinRight, LOW);
+
+    digitalWrite(hipLeft, HIGH);
+    mpu.getMotion6(&ax5, &ay5, &az5, &gx5, &gy5, &gz5);  
+    digitalWrite(hipLeft, LOW);
+
+    digitalWrite(hipRight, HIGH);
+    mpu.getMotion6(&ax6, &ay6, &az6, &gx6, &gy6, &gz6); 
+    digitalWrite(hipRight, LOW); 
+
+    if(xQueueReceive(arrayQueue, &arrayGPIO, 0) == pdPASS ){
+      client.println(String(arrayGPIO[0]) + ";" + arrayGPIO[1] + ";" + arrayGPIO[2] + ";" + arrayGPIO[3]+ ";" + 
+        *ax1_uk + ";" + *ay1_uk + ";" + *az1_uk + ";" + *gx1_uk + ";" + *gy1_uk + ";" + *gz1_uk + ";" + 
+        *ax2_uk + ";" + *ay2_uk + ";" + *az2_uk + ";" + *gx2_uk + ";" + *gy2_uk + ";" + *gz2_uk + ";" +
+        *ax3_uk + ";" + *ay3_uk + ";" + *az3_uk + ";" + *gx3_uk + ";" + *gy3_uk + ";" + *gz3_uk + ";" +
+        *ax4_uk + ";" + *ay4_uk + ";" + *az4_uk + ";" + *gx4_uk + ";" + *gy4_uk + ";" + *gz4_uk + ";" +
+        *ax5_uk + ";" + *ay5_uk + ";" + *az5_uk + ";" + *gx5_uk + ";" + *gy5_uk + ";" + *gz5_uk + ";" +
+        *ax6_uk + ";" + *ay6_uk + ";" + *az6_uk + ";" + *gx6_uk + ";" + *gy6_uk + ";" + *gz6_uk + ";" +
+        arrayGPIO[4] + ";" + arrayGPIO[5]);
+    }
+  }
